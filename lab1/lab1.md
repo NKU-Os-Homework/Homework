@@ -1,12 +1,28 @@
 # 练习
 ## 练习1
 ```
-la sp, bootstacktop
- tail kern_init
+#include <mmu.h>
+#include <memlayout.h>
+
+    .section .text,"ax",%progbits
+    .globl kern_entry
+kern_entry:
+    la sp, bootstacktop
+
+    tail kern_init
+
+.section .data
+    # .align 2^12
+    .align PGSHIFT
+    .global bootstack
+bootstack:
+    .space KSTACKSIZE
+    .global bootstacktop
+bootstacktop:
 ```
 1. la sp, bootstacktop完成了将bootstacktop标签处的地址值赋给sp的操作，该汇编语句的作用是初始化操作系统内核栈
 
-2. tail kern_init用于实现函数调用，这是一种特殊的函数调用，称为尾调用（tail call）。尾调用是一种优化技术，它在调用一个函数之后，不需要在返回时执行额外的操作，而是直接跳转到被调用函数的入口点，这有助于减少栈空间的使用。该语句用于将控制权转移给真正的入口点kern_init
+2. tail kern_init用于实现函数调用，这是一种特殊的函数调用，称为尾调用（tail call）。尾调用是一种优化技术，它在调用一个函数之后，不需要在返回时执行额外的操作，而是直接跳转到被调用函数的入口点，这有助于减少栈空间的使用，同时可以确保内核不会返回到引导加载程序或操作系统之外。该语句用于将控制权转移给真正的入口点kern_init。 
 
 ## 练习2
 
@@ -14,8 +30,17 @@ la sp, bootstacktop
 
 ## challenge1
 1. ucore中断异常的处理流程：当时钟中断产生时，操作系统会保存pc中触发中断异常的指令地址，同时将pc值设为stvec寄存器的值（中断处理程序的入口点），跳转到`kern/trap/trapentry.S`的`__alltraps`标记，保存当前执行流的上下文，并通过函数调用，切换为`kern/trap/trap.c`的中断处理函数`trap()`的上下文，进入`trap()`的执行流。切换前的上下文作为一个结构体，传递给`trap()`作为函数参数 -> `kern/trap/trap.c`按照中断类型进行分发(`trap_dispatch(), interrupt_handler()`)->执行时钟中断对应的处理语句，累加计数器，设置下一次时钟中断->完成处理，返回到`kern/trap/trapentry.S`->恢复原先的上下文，中断处理结束。
+<br>
 
-2. mov a0，sp的目的：该语句其实是在为下面这条汇编调用c函数的汇编语句jal trap，准备执行环境，a0寄存器在riscv体系结构中是用来传递函数调用参数的，将sp值赋给a0，其实就是将保存切换前的上下文的栈地址传递给函数void trap(struct trapframe *tf) { trap_dispatch(tf);}
+2. mov a0，sp的目的：该语句其实是在为下面这条汇编调用c函数的汇编语句jal trap，准备执行环境，a0寄存器在riscv体系结构中是用来传递函数调用参数的，将sp值赋给a0，其实就是将保存切换前的上下文的栈地址传递给函数void trap(struct trapframe *tf) { trap_dispatch(tf);}，将栈指针的值传递给异常处理程序，以便它可以访问当前的栈帧和栈上的数据。
+ ```
+ __alltraps:
+    SAVE_ALL
+
+    move  a0, sp
+    jal trap
+    # sp should be the same as before "jal trap"
+ ```
 
 3. SAVE_ALL中寄寄存器保存在栈中的位置由当前栈顶指针sp确定
 
@@ -31,7 +56,7 @@ la sp, bootstacktop
 
 1. 出现中断时，中断返回地址 mepc 的值被更新为下一条尚未执行的指令
 
-出现异常时，中断返回地址 mepc 的值被更新为当前发生异常的指令 PC，在异常处理程序中软件改变 mepc 指向下一条指令，由于现在 ecall/ebreak（或 c.ebreak）是 4（或 2）字节指令，因此改写设定 mepc=mepc+4（或+2）即可。
+ 出现异常时，中断返回地址 mepc 的值被更新为当前发生异常的指令 PC，在异常处理程序中软件改变 mepc 指向下一条指令，由于现在 ecall/ebreak（或 c.ebreak）是 4（或 2）字节指令，因此改写设定 mepc=mepc+4（或+2）即可。
 
 2. 代码见编程部分
 
