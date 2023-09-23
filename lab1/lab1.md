@@ -28,8 +28,9 @@ bootstacktop:
 
 见编程部分
 
-## challenge1
-1. ucore中断异常的处理流程：当时钟中断产生时，操作系统会保存pc中触发中断异常的指令地址，同时将pc值设为stvec寄存器的值（中断处理程序的入口点），跳转到`kern/trap/trapentry.S`的`__alltraps`标记，保存当前执行流的上下文，并通过函数调用，切换为`kern/trap/trap.c`的中断处理函数`trap()`的上下文，进入`trap()`的执行流。切换前的上下文作为一个结构体，传递给`trap()`作为函数参数 -> `kern/trap/trap.c`按照中断类型进行分发(`trap_dispatch(), interrupt_handler()`)->执行时钟中断对应的处理语句，累加计数器，设置下一次时钟中断->完成处理，返回到`kern/trap/trapentry.S`->恢复原先的上下文，中断处理结束。
+### challenge1
+1. ucore中断异常的处理流程：当时钟中断产生时，操作系统会保存pc中触发中断异常的指令地址，同时将pc值设为stvec寄存器的值（中断处理程序的入口点），跳转到`kern/trap/trapentry.S`的`__alltraps`标记，保存当前执行流的上下文，并通过函数调用，切换为`kern/trap/trap.c`的中断处理函数`trap()`的上下文，进入`trap()`的执行流。
+切换前的上下文作为一个结构体，传递给`trap()`作为函数参数 -> `kern/trap/trap.c`按照中断类型进行分发(`trap_dispatch(), interrupt_handler()`)->执行时钟中断对应的处理语句，累加计数器，设置下一次时钟中断->完成处理，返回到`kern/trap/trapentry.S`->恢复原先的上下文，中断处理结束。
 <br>
 
 2. mov a0，sp的目的：该语句其实是在为下面这条汇编调用c函数的汇编语句jal trap，准备执行环境，a0寄存器在riscv体系结构中是用来传递函数调用参数的，将sp值赋给a0，其实就是将保存切换前的上下文的栈地址传递给函数void trap(struct trapframe *tf) { trap_dispatch(tf);}，将栈指针的值传递给异常处理程序，以便它可以访问当前的栈帧和栈上的数据。
@@ -43,16 +44,43 @@ bootstacktop:
  ```
 
 3. SAVE_ALL中寄寄存器保存在栈中的位置由当前栈顶指针sp确定
+ ```
+ addi sp, sp, -36 * REGBYTES
+ # save x registers
+ STORE x0, 0*REGBYTES(sp)
+ ```
 
-4. 不需要，保存寄存器的需求取决于中断的类型和处理程序的具体需求，不同类型的中断可能需要保存不同的寄存器，保存和恢复所有寄存器可能会引入额外的开销，包括内存访问和指令执行。如果中断处理程序可以在不保存所有寄存器的情况下正常工作，那么可以减小中断处理的开销，提高性能。
+4. 不需要，保存寄存器的需求取决于中断的类型和处理程序的具体需求，不同类型的中断可能需要保存不同的寄存器，保存和恢复所有寄存器可能会引入额外的开销，包括内存访问和指令执行。如果中断处理程序可以在不保存所有寄存器的情况下正常工作，那么可以减小中断处理的开销，提高性能。一般来说，中断和异常可以分为两种类型：可屏蔽中断（Maskable Interrupts）和非可屏蔽中断和异常（Non-Maskable Interrupts and Exceptions）。对于可屏蔽中断，可以选择在进入中断处理程序之前保存和恢复一部分寄存器，而不是所有寄存器。对于非可屏蔽中断和异常，通常会保存所有寄存器，因为无法信任中断处理程序的行为，需要确保所有寄存器状态都能够被完全恢复。
 
-## challenge2
+### challenge2
 
-1. csrw sscratch, sp；csrrw s0, sscratch, x0实现了什么操作：csrw sscratch, sp将sp寄存器中的值赋给sscratch，csrrw s0, sscratch, x0将sscratch的当前值写入目标寄存器`s0`，并将CSR `sscratch` 的值设置为零。目的：保存之前写到sscratch里的sp的值
+1. csrw sscratch, sp；csrrw s0, sscratch, x0实现了什么操作：csrw sscratch, sp将sp寄存器中的值赋给sscratch，csrrw s0, sscratch, x0将sscratch的当前值写入目标寄存器`s0`，并将CSR `sscratch` 的值设置为零。
+目的：保存之前写到sscratch里的sp的值
+ ```
+     .macro SAVE_ALL
 
-2. 这主要是因为badaddr寄存器和cause寄存器中保存的分别是出错的地址以及出错的原因，在处理中断时可以利用这些信息，当我们处理完这个中断的时候，也就不需要这两个寄存器中保存的值，所以可以不用恢复这两个寄存器。而当由新的中断发生时，系统会自动设置这两个寄存器的值
+    csrw sscratch, sp
 
-## challenge3
+    addi sp, sp, -36 * REGBYTES
+    ......
+    # get sr, epc, badvaddr, cause
+    # Set sscratch register to 0, so that if a recursive exception
+    # occurs, the exception vector knows it came from the kernel
+    csrrw s0, sscratch, x0
+--------------------------------------------------------
+    .macro RESTORE_ALL
+
+    LOAD s1, 32*REGBYTES(sp)
+    LOAD s2, 33*REGBYTES(sp)
+
+    csrw sstatus, s1
+    csrw sepc, s2
+
+ ```
+
+2. 这主要是因为badvaddr寄存器和cause寄存器中保存的分别是出错的地址以及出错的原因，在处理中断时可以利用这些信息，当我们处理完这个中断的时候，也就不需要这两个寄存器中保存的值，所以可以不用恢复这两个寄存器。而当由新的中断发生时，系统会自动设置这两个寄存器的值
+
+### challenge3
 
 1. 出现中断时，中断返回地址 mepc 的值被更新为下一条尚未执行的指令
 
