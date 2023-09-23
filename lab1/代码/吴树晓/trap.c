@@ -164,7 +164,7 @@ void exception_handler(struct trapframe *tf) {
             */
             cprintf("Exception type : Illegal instruction");
             cprintf("Illegal instruction caught at 0x%016x" , tf->epc);
-            tf->epc += 4;
+            tf -> epc += 4;
             break;
         case CAUSE_BREAKPOINT:
             //断点异常处理
@@ -175,7 +175,7 @@ void exception_handler(struct trapframe *tf) {
             */
             cprintf("Exception type : breakpoint");
             cprintf("ebreak caught at 0x%016x" , tf->epc);
-            tf->epc += 2;
+            tf -> epc += 2;
             break;
         case CAUSE_MISALIGNED_LOAD:
             break;
