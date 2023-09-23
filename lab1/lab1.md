@@ -23,7 +23,7 @@ la sp, bootstacktop
 
 ## challenge2
 
-1. csrw sscratch, sp；csrrw s0, sscratch, x0实现了什么操作：csrw sscratch, sp将sp寄存器中的值赋给sscratch，csrrw s0, sscratch, x0将sscratch的当前值写入目标寄存器`s0`，并将CSR `sscratch` 的值设置为零。目的：保存之前写到sscratch里的sp的值
+1. csrw sscratch, sp；csrrw s0, sscratch, x0实现了什么操作：csrw sscratch, sp将sp寄存器中的值赋给sscratch，csrrw s0, sscratch, x0将sscratch的当前值写入目标寄存器`s0`，并将CSR `sscratch` 的值设置为零。目的：保存之前写到sscratch里的sp的值
 
 2. 这主要是因为badaddr寄存器和cause寄存器中保存的分别是出错的地址以及出错的原因，在处理中断时可以利用这些信息，当我们处理完这个中断的时候，也就不需要这两个寄存器中保存的值，所以可以不用恢复这两个寄存器。而当由新的中断发生时，系统会自动设置这两个寄存器的值
 
@@ -33,7 +33,7 @@ la sp, bootstacktop
 
 出现异常时，中断返回地址 mepc 的值被更新为当前发生异常的指令 PC，在异常处理程序中软件改变 mepc 指向下一条指令，由于现在 ecall/ebreak（或 c.ebreak）是 4（或 2）字节指令，因此改写设定 mepc=mepc+4（或+2）即可。
 
-2.代码见编程部分
+2. 代码见编程部分
 
 # 操作系统知识点与原理
 
