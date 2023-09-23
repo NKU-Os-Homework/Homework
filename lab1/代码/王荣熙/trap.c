@@ -115,7 +115,7 @@ void interrupt_handler(struct trapframe *tf) {
             clock_set_next_event();//设置下次时钟中断
             ticks +=1 ;
             if(ticks % TICK_NUM == 0){
-                cprintf("100ticks\n");
+                cprintf("100 ticks\n");
                 num += 1;
                 if(num == 10){
                     sbi_shutdown();
