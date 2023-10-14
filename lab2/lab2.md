@@ -70,7 +70,7 @@ struct Page {
 
 ## 练习2：实现 Best-Fit 连续物理内存分配算法
 
-Best-Fit 算法的主要思想是为了分配n字节，使用最小的可用空闲块，以致块的尺寸比n大（为了避免分割大空闲块，为了最小化外部碎片产生的尺寸）。基于这个思想，主要对 first-fit 算法的一下部分进行了修改：
+Best-Fit 算法的主要思想是为了分配n字节，使用最小的可用空闲块，以致块的尺寸比n大（为了避免分割大空闲块，为了最小化外部碎片产生的尺寸）。基于这个思想，主要对 first-fit 算法的以下部分进行了修改：
 
 ```C
 if (n > nr_free) {
@@ -87,4 +87,25 @@ while ((le = list_next(le)) != &free_list) {
 }
 ```
 
-代码见编程部分
+根据上面的代码，基于Best-Fit 算法的主要思想，编写下面的Best-Fit 算法代码：
+
+```
+struct Page *page = NULL;
+    list_entry_t *le = &free_list;
+    size_t min_size = nr_free + 1;
+     /*LAB2 EXERCISE 2: YOUR CODE: 2113414、2112117、2113021*/ 
+    // 下面的代码是first-fit的部分代码，请修改下面的代码改为best-fit
+    // 遍历空闲链表，查找满足需求的空闲页框
+    // 如果找到满足需求的页面，记录该页面以及当前找到的最小连续空闲页框数量
+    while ((le = list_next(le)) != &free_list) {
+        struct Page *p = le2page(le, page_link);
+        if (p->property >= n && min_size > p->property) {
+            page = p;
+            min_size = p->property;
+        }
+    }
+```
+
+首先创建一个min_size变量，大小是nr_free + 1，方便进行之后的更新。接下来，主要针对满足条件的可用空闲块进行查找。通过while循环，每次查找如果找到的可用空闲块大于需要的，同时min_size也大于这次找到的可用空闲块，则更新这两个量，如果有一个条件不满足，就进行下一轮循环，直到循环结束。最后得到的指针和min_size指向最小的可用空闲块，以致块的尺寸比n大。
+
+具体代码见编程部分
