@@ -67,3 +67,24 @@ struct Page {
 ### 算法不足
 
 算法还有改进空间，比如当前使用的是线性搜索的方式来寻找合适的空闲块进行分配。这种方式的时间复杂度为O(n)，其中n为空闲块的数量。可以使用更高效的数据结构，如二叉搜索树或哈希表，来加速寻址过程。
+
+## 练习2：实现 Best-Fit 连续物理内存分配算法
+
+Best-Fit 算法的主要思想是为了分配n字节，使用最小的可用空闲块，以致块的尺寸比n大（为了避免分割大空闲块，为了最小化外部碎片产生的尺寸）。基于这个思想，主要对 first-fit 算法的一下部分进行了修改：
+
+```C
+if (n > nr_free) {
+    return NULL;
+}
+struct Page *page = NULL;
+list_entry_t *le = &free_list;
+while ((le = list_next(le)) != &free_list) {
+    struct Page *p = le2page(le, page_link);
+    if (p->property >= n) {
+        page = p;
+        break;
+    }
+}
+```
+
+代码见编程部分
