@@ -119,7 +119,6 @@ best_fit_alloc_pages(size_t n) {
         if (p->property >= n && min_size > p->property) {
             page = p;
             min_size = p->property;
-            break;
         }
     }
 
