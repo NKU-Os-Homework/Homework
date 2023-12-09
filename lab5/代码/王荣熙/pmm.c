@@ -1,1019 +1,717 @@
-#include <proc.h>
-#include <kmalloc.h>
-#include <string.h>
-#include <sync.h>
-#include <pmm.h>
+#include <default_pmm.h>
+#include <defs.h>
 #include <error.h>
-#include <sched.h>
-#include <elf.h>
-#include <vmm.h>
-#include <trap.h>
+#include <kmalloc.h>
+#include <memlayout.h>
+#include <mmu.h>
+#include <pmm.h>
+#include <sbi.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <assert.h>
-#include <unistd.h>
+#include <string.h>
+#include <swap.h>
+#include <sync.h>
+#include <vmm.h>
+#include <riscv.h>
 
-/* ------------- process/thread mechanism design&implementation -------------
-(an simplified Linux process/thread mechanism )
-introduction:
-  ucore implements a simple process/thread mechanism. process contains the independent memory sapce, at least one threads
-for execution, the kernel data(for management), processor state (for context switch), files(in lab6), etc. ucore needs to
-manage all these details efficiently. In ucore, a thread is just a special kind of process(share process's memory).
-------------------------------
-process state       :     meaning               -- reason
-    PROC_UNINIT     :   uninitialized           -- alloc_proc
-    PROC_SLEEPING   :   sleeping                -- try_free_pages, do_wait, do_sleep
-    PROC_RUNNABLE   :   runnable(maybe running) -- proc_init, wakeup_proc,
-    PROC_ZOMBIE     :   almost dead             -- do_exit
+// virtual address of physical page array
+struct Page *pages;
+// amount of physical memory (in pages)
+size_t npage = 0;
+// The kernel image is mapped at VA=KERNBASE and PA=info.base
+uint_t va_pa_offset;
+// memory starts at 0x80000000 in RISC-V
+const size_t nbase = DRAM_BASE / PGSIZE;
 
------------------------------
-process state changing:
+// virtual address of boot-time page directory
+pde_t *boot_pgdir = NULL;
+// physical address of boot-time page directory
+uintptr_t boot_cr3;
 
-  alloc_proc                                 RUNNING
-      +                                   +--<----<--+
-      +                                   + proc_run +
-      V                                   +-->---->--+
-PROC_UNINIT -- proc_init/wakeup_proc --> PROC_RUNNABLE -- try_free_pages/do_wait/do_sleep --> PROC_SLEEPING --
-                                           A      +                                                           +
-                                           |      +--- do_exit --> PROC_ZOMBIE                                +
-                                           +                                                                  +
-                                           -----------------------wakeup_proc----------------------------------
------------------------------
-process relations
-parent:           proc->parent  (proc is children)
-children:         proc->cptr    (proc is parent)
-older sibling:    proc->optr    (proc is younger sibling)
-younger sibling:  proc->yptr    (proc is older sibling)
------------------------------
-related syscall for process:
-SYS_exit        : process exit,                           -->do_exit
-SYS_fork        : create child process, dup mm            -->do_fork-->wakeup_proc
-SYS_wait        : wait process                            -->do_wait
-SYS_exec        : after fork, process execute a program   -->load a program and refresh the mm
-SYS_clone       : create child thread                     -->do_fork-->wakeup_proc
-SYS_yield       : process flag itself need resecheduling, -- proc->need_sched=1, then scheduler will rescheule this process
-SYS_sleep       : process sleep                           -->do_sleep
-SYS_kill        : kill process                            -->do_kill-->proc->flags |= PF_EXITING
-                                                                 -->wakeup_proc-->do_wait-->do_exit
-SYS_getpid      : get the process's pid
+// physical memory management
+const struct pmm_manager *pmm_manager;
 
-*/
+static void check_alloc_page(void);
+static void check_pgdir(void);
+static void check_boot_pgdir(void);
 
-// the process set's list
-list_entry_t proc_list;
-
-#define HASH_SHIFT 10
-#define HASH_LIST_SIZE (1 << HASH_SHIFT)
-#define pid_hashfn(x) (hash32(x, HASH_SHIFT))
-
-// has list for process set based on pid
-static list_entry_t hash_list[HASH_LIST_SIZE];
-
-// idle proc
-struct proc_struct *idleproc = NULL;
-// init proc
-struct proc_struct *initproc = NULL;
-// current proc
-struct proc_struct *current = NULL;
-
-static int nr_process = 0;
-
-void kernel_thread_entry(void);
-void forkrets(struct trapframe *tf);
-void switch_to(struct context *from, struct context *to);
-
-// alloc_proc - alloc a proc_struct and init all fields of proc_struct
-static struct proc_struct *
-alloc_proc(void)
+// init_pmm_manager - initialize a pmm_manager instance
+static void init_pmm_manager(void)
 {
-    struct proc_struct *proc = kmalloc(sizeof(struct proc_struct));
-    if (proc != NULL)
-    {
-        // LAB4:EXERCISE1 YOUR CODE
-        /*
-         * below fields in proc_struct need to be initialized
-         *       enum proc_state state;                      // Process state
-         *       int pid;                                    // Process ID
-         *       int runs;                                   // the running times of Proces
-         *       uintptr_t kstack;                           // Process kernel stack
-         *       volatile bool need_resched;                 // bool value: need to be rescheduled to release CPU?
-         *       struct proc_struct *parent;                 // the parent process
-         *       struct mm_struct *mm;                       // Process's memory management field
-         *       struct context context;                     // Switch here to run process
-         *       struct trapframe *tf;                       // Trap frame for current interrupt
-         *       uintptr_t cr3;                              // CR3 register: the base addr of Page Directroy Table(PDT)
-         *       uint32_t flags;                             // Process flag
-         *       char name[PROC_NAME_LEN + 1];               // Process name
-         */
-
-        proc->state = PROC_UNINIT;
-        proc->pid = -1;
-        proc->runs = 0;
-        proc->kstack = 0;
-        proc->need_resched = 0;
-        proc->parent = NULL;
-        proc->mm = NULL;
-        memset(&(proc->context), 0, sizeof(struct context));
-        proc->tf = NULL;
-        proc->cr3 = boot_cr3;
-        proc->flags = 0;
-        memset(proc->name, 0, PROC_NAME_LEN);
-
-        // LAB5 YOUR CODE : 2113414 (update LAB4 steps)
-        /*
-         * below fields(add in LAB5) in proc_struct need to be initialized
-         *       uint32_t wait_state;                        // waiting state
-         *       struct proc_struct *cptr, *yptr, *optr;     // relations between processes
-         */
-
-        proc->wait_state = 0;
-        proc->cptr = proc->optr = proc->yptr = NULL;
-    }
-    return proc;
+    pmm_manager = &default_pmm_manager;
+    cprintf("memory management: %s\n", pmm_manager->name);
+    pmm_manager->init();
 }
 
-// set_proc_name - set the name of proc
-char *
-set_proc_name(struct proc_struct *proc, const char *name)
+// init_memmap - call pmm->init_memmap to build Page struct for free memory
+static void init_memmap(struct Page *base, size_t n)
 {
-    memset(proc->name, 0, sizeof(proc->name));
-    return memcpy(proc->name, name, PROC_NAME_LEN);
+    pmm_manager->init_memmap(base, n);
 }
 
-// get_proc_name - get the name of proc
-char *
-get_proc_name(struct proc_struct *proc)
+// alloc_pages - call pmm->alloc_pages to allocate a continuous n*PAGESIZE
+// memory
+struct Page *alloc_pages(size_t n)
 {
-    static char name[PROC_NAME_LEN + 1];
-    memset(name, 0, sizeof(name));
-    return memcpy(name, proc->name, PROC_NAME_LEN);
-}
+    struct Page *page = NULL;
+    bool intr_flag;
 
-// set_links - set the relation links of process
-static void
-set_links(struct proc_struct *proc)
-{
-    list_add(&proc_list, &(proc->list_link));
-    proc->yptr = NULL;
-    if ((proc->optr = proc->parent->cptr) != NULL)
+    while (1)
     {
-        proc->optr->yptr = proc;
-    }
-    proc->parent->cptr = proc;
-    nr_process++;
-}
-
-// remove_links - clean the relation links of process
-static void
-remove_links(struct proc_struct *proc)
-{
-    list_del(&(proc->list_link));
-    if (proc->optr != NULL)
-    {
-        proc->optr->yptr = proc->yptr;
-    }
-    if (proc->yptr != NULL)
-    {
-        proc->yptr->optr = proc->optr;
-    }
-    else
-    {
-        proc->parent->cptr = proc->optr;
-    }
-    nr_process--;
-}
-
-// get_pid - alloc a unique pid for process
-static int
-get_pid(void)
-{
-    static_assert(MAX_PID > MAX_PROCESS);
-    struct proc_struct *proc;
-    list_entry_t *list = &proc_list, *le;
-    static int next_safe = MAX_PID, last_pid = MAX_PID;
-    if (++last_pid >= MAX_PID)
-    {
-        last_pid = 1;
-        goto inside;
-    }
-    if (last_pid >= next_safe)
-    {
-    inside:
-        next_safe = MAX_PID;
-    repeat:
-        le = list;
-        while ((le = list_next(le)) != list)
-        {
-            proc = le2proc(le, list_link);
-            if (proc->pid == last_pid)
-            {
-                if (++last_pid >= next_safe)
-                {
-                    if (last_pid >= MAX_PID)
-                    {
-                        last_pid = 1;
-                    }
-                    next_safe = MAX_PID;
-                    goto repeat;
-                }
-            }
-            else if (proc->pid > last_pid && next_safe > proc->pid)
-            {
-                next_safe = proc->pid;
-            }
-        }
-    }
-    return last_pid;
-}
-
-// proc_run - make process "proc" running on cpu
-// NOTE: before call switch_to, should load  base addr of "proc"'s new PDT
-void proc_run(struct proc_struct *proc)
-{
-    if (proc != current)
-    {
-        // LAB4:EXERCISE3 YOUR CODE
-        /*
-         * Some Useful MACROs, Functions and DEFINEs, you can use them in below implementation.
-         * MACROs or Functions:
-         *   local_intr_save():        Disable interrupts
-         *   local_intr_restore():     Enable Interrupts
-         *   lcr3():                   Modify the value of CR3 register
-         *   switch_to():              Context switching between two processes
-         */
-        bool intr_flag;
-        struct proc_struct *prev = current, *next = proc;
         local_intr_save(intr_flag);
         {
-            current = proc;
-            lcr3(proc->cr3);
-            switch_to(&(prev->context), &(next->context));
+            page = pmm_manager->alloc_pages(n);
         }
         local_intr_restore(intr_flag);
+
+        if (page != NULL || n > 1 || swap_init_ok == 0)
+            break;
+
+        extern struct mm_struct *check_mm_struct;
+        // cprintf("page %x, call swap_out in alloc_pages %d\n",page, n);
+        swap_out(check_mm_struct, n, 0);
+    }
+    // cprintf("n %d,get page %x, No %d in alloc_pages\n",n,page,(page-pages));
+    return page;
+}
+
+// free_pages - call pmm->free_pages to free a continuous n*PAGESIZE memory
+void free_pages(struct Page *base, size_t n)
+{
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    {
+        pmm_manager->free_pages(base, n);
+    }
+    local_intr_restore(intr_flag);
+}
+
+// nr_free_pages - call pmm->nr_free_pages to get the size (nr*PAGESIZE)
+// of current free memory
+size_t nr_free_pages(void)
+{
+    size_t ret;
+    bool intr_flag;
+    local_intr_save(intr_flag);
+    {
+        ret = pmm_manager->nr_free_pages();
+    }
+    local_intr_restore(intr_flag);
+    return ret;
+}
+
+/* pmm_init - initialize the physical memory management */
+static void page_init(void)
+{
+    extern char kern_entry[];
+
+    va_pa_offset = KERNBASE - 0x80200000;
+
+    uint_t mem_begin = KERNEL_BEGIN_PADDR;
+    uint_t mem_size = PHYSICAL_MEMORY_END - KERNEL_BEGIN_PADDR;
+    uint_t mem_end = PHYSICAL_MEMORY_END;
+
+    cprintf("physcial memory map:\n");
+    cprintf("  memory: 0x%08lx, [0x%08lx, 0x%08lx].\n", mem_size, mem_begin,
+            mem_end - 1);
+
+    uint64_t maxpa = mem_end;
+
+    if (maxpa > KERNTOP)
+    {
+        maxpa = KERNTOP;
+    }
+
+    extern char end[];
+
+    npage = maxpa / PGSIZE;
+    // BBL has put the initial page table at the first available page after the
+    // kernel
+    // so stay away from it by adding extra offset to end
+    pages = (struct Page *)ROUNDUP((void *)end, PGSIZE);
+
+    for (size_t i = 0; i < npage - nbase; i++)
+    {
+        SetPageReserved(pages + i);
+    }
+
+    uintptr_t freemem = PADDR((uintptr_t)pages + sizeof(struct Page) * (npage - nbase));
+
+    mem_begin = ROUNDUP(freemem, PGSIZE);
+    mem_end = ROUNDDOWN(mem_end, PGSIZE);
+    if (freemem < mem_end)
+    {
+        init_memmap(pa2page(mem_begin), (mem_end - mem_begin) / PGSIZE);
+    }
+    cprintf("vapaofset is %llu\n", va_pa_offset);
+}
+
+// boot_map_segment - setup&enable the paging mechanism
+// parameters
+//  la:   linear address of this memory need to map (after x86 segment map)
+//  size: memory size
+//  pa:   physical address of this memory
+//  perm: permission of this memory
+static void boot_map_segment(pde_t *pgdir, uintptr_t la, size_t size,
+                             uintptr_t pa, uint32_t perm)
+{
+    assert(PGOFF(la) == PGOFF(pa));
+    size_t n = ROUNDUP(size + PGOFF(la), PGSIZE) / PGSIZE;
+    la = ROUNDDOWN(la, PGSIZE);
+    pa = ROUNDDOWN(pa, PGSIZE);
+    for (; n > 0; n--, la += PGSIZE, pa += PGSIZE)
+    {
+        pte_t *ptep = get_pte(pgdir, la, 1);
+        assert(ptep != NULL);
+        *ptep = pte_create(pa >> PGSHIFT, PTE_V | perm);
     }
 }
 
-// forkret -- the first kernel entry point of a new thread/process
-// NOTE: the addr of forkret is setted in copy_thread function
-//       after switch_to, the current proc will execute here.
-static void
-forkret(void)
+// boot_alloc_page - allocate one page using pmm->alloc_pages(1)
+// return value: the kernel virtual address of this allocated page
+// note: this function is used to get the memory for PDT(Page Directory
+// Table)&PT(Page Table)
+static void *boot_alloc_page(void)
 {
-    forkrets(current->tf);
-}
-
-// hash_proc - add proc into proc hash_list
-static void
-hash_proc(struct proc_struct *proc)
-{
-    list_add(hash_list + pid_hashfn(proc->pid), &(proc->hash_link));
-}
-
-// unhash_proc - delete proc from proc hash_list
-static void
-unhash_proc(struct proc_struct *proc)
-{
-    list_del(&(proc->hash_link));
-}
-
-// find_proc - find proc frome proc hash_list according to pid
-struct proc_struct *
-find_proc(int pid)
-{
-    if (0 < pid && pid < MAX_PID)
+    struct Page *p = alloc_page();
+    if (p == NULL)
     {
-        list_entry_t *list = hash_list + pid_hashfn(pid), *le = list;
-        while ((le = list_next(le)) != list)
+        panic("boot_alloc_page failed.\n");
+    }
+    return page2kva(p);
+}
+
+// pmm_init - setup a pmm to manage physical memory, build PDT&PT to setup
+// paging mechanism
+//         - check the correctness of pmm & paging mechanism, print PDT&PT
+void pmm_init(void)
+{
+    // We need to alloc/free the physical memory (granularity is 4KB or other
+    // size).
+    // So a framework of physical memory manager (struct pmm_manager)is defined
+    // in pmm.h
+    // First we should init a physical memory manager(pmm) based on the
+    // framework.
+    // Then pmm can alloc/free the physical memory.
+    // Now the first_fit/best_fit/worst_fit/buddy_system pmm are available.
+    init_pmm_manager();
+
+    // detect physical memory space, reserve already used memory,
+    // then use pmm->init_memmap to create free page list
+    page_init();
+
+    // use pmm->check to verify the correctness of the alloc/free function in a
+    // pmm
+    check_alloc_page();
+
+    // create boot_pgdir, an initial page directory(Page Directory Table, PDT)
+    extern char boot_page_table_sv39[];
+    boot_pgdir = (pte_t *)boot_page_table_sv39;
+    boot_cr3 = PADDR(boot_pgdir);
+
+    check_pgdir();
+
+    static_assert(KERNBASE % PTSIZE == 0 && KERNTOP % PTSIZE == 0);
+
+    // now the basic virtual memory map(see memalyout.h) is established.
+    // check the correctness of the basic virtual memory map.
+    check_boot_pgdir();
+
+    kmalloc_init();
+}
+
+// get_pte - get pte and return the kernel virtual address of this pte for la
+//        - if the PT contians this pte didn't exist, alloc a page for PT
+// parameter:
+//  pgdir:  the kernel virtual base address of PDT
+//  la:     the linear address need to map
+//  create: a logical value to decide if alloc a page for PT
+// return vaule: the kernel virtual address of this pte
+pte_t *get_pte(pde_t *pgdir, uintptr_t la, bool create)
+{
+    pde_t *pdep1 = &pgdir[PDX1(la)];
+    if (!(*pdep1 & PTE_V))
+    {
+        struct Page *page;
+        if (!create || (page = alloc_page()) == NULL)
         {
-            struct proc_struct *proc = le2proc(le, hash_link);
-            if (proc->pid == pid)
-            {
-                return proc;
-            }
+            return NULL;
         }
+        set_page_ref(page, 1);
+        uintptr_t pa = page2pa(page);
+        memset(KADDR(pa), 0, PGSIZE);
+        *pdep1 = pte_create(page2ppn(page), PTE_U | PTE_V);
+    }
+
+    pde_t *pdep0 = &((pde_t *)KADDR(PDE_ADDR(*pdep1)))[PDX0(la)];
+    if (!(*pdep0 & PTE_V))
+    {
+        struct Page *page;
+        if (!create || (page = alloc_page()) == NULL)
+        {
+            return NULL;
+        }
+        set_page_ref(page, 1);
+        uintptr_t pa = page2pa(page);
+        memset(KADDR(pa), 0, PGSIZE);
+        *pdep0 = pte_create(page2ppn(page), PTE_U | PTE_V);
+    }
+    return &((pte_t *)KADDR(PDE_ADDR(*pdep0)))[PTX(la)];
+}
+
+// get_page - get related Page struct for linear address la using PDT pgdir
+struct Page *get_page(pde_t *pgdir, uintptr_t la, pte_t **ptep_store)
+{
+    pte_t *ptep = get_pte(pgdir, la, 0);
+    if (ptep_store != NULL)
+    {
+        *ptep_store = ptep;
+    }
+    if (ptep != NULL && *ptep & PTE_V)
+    {
+        return pte2page(*ptep);
     }
     return NULL;
 }
 
-// kernel_thread - create a kernel thread using "fn" function
-// NOTE: the contents of temp trapframe tf will be copied to
-//       proc->tf in do_fork-->copy_thread function
-int kernel_thread(int (*fn)(void *), void *arg, uint32_t clone_flags)
+// page_remove_pte - free an Page sturct which is related linear address la
+//                - and clean(invalidate) pte which is related linear address la
+// note: PT is changed, so the TLB need to be invalidate
+/*
+(1) 检查页表项是否有效（PTE_V标志位被设置）。
+(2) 通过页表项获取对应的物理页结构体 struct Page。
+(3) 减少物理页的引用计数（reference count）。
+(4) 如果物理页的引用计数减少到0，表示没有页面在使用，释放该物理页。
+(5) 清空页表项，将其设置为0。
+(6) 刷新TLB（Translation Lookaside Buffer），确保页表变更后的地址转换能够正常进行。
+这个函数的作用是在虚拟地址空间中删除某个地址对应的页表项，并根据需要释放相应的物理页。这在操作系统中的内存管理中很常见，确保页面在不再被引用时能够被正确释放。
+*/
+static inline void page_remove_pte(pde_t *pgdir, uintptr_t la, pte_t *ptep)
 {
-    struct trapframe tf;
-    memset(&tf, 0, sizeof(struct trapframe));
-    tf.gpr.s0 = (uintptr_t)fn;
-    tf.gpr.s1 = (uintptr_t)arg;
-    tf.status = (read_csr(sstatus) | SSTATUS_SPP | SSTATUS_SPIE) & ~SSTATUS_SIE;
-    tf.epc = (uintptr_t)kernel_thread_entry;
-    return do_fork(clone_flags | CLONE_VM, 0, &tf);
-}
-
-// setup_kstack - alloc pages with size KSTACKPAGE as process kernel stack
-static int
-setup_kstack(struct proc_struct *proc)
-{
-    struct Page *page = alloc_pages(KSTACKPAGE);
-    if (page != NULL)
-    {
-        proc->kstack = (uintptr_t)page2kva(page);
-        return 0;
+    if (*ptep & PTE_V)
+    { //(1) check if this page table entry is
+        struct Page *page =
+            pte2page(*ptep); //(2) find corresponding page to pte
+        page_ref_dec(page);  //(3) decrease page reference
+        if (page_ref(page) ==
+            0)
+        { //(4) and free this page when page reference reachs 0
+            free_page(page);
+        }
+        *ptep = 0;                 //(5) clear second page table entry
+        tlb_invalidate(pgdir, la); //(6) flush tlb
     }
-    return -E_NO_MEM;
 }
 
-// put_kstack - free the memory space of process kernel stack
-static void
-put_kstack(struct proc_struct *proc)
+void unmap_range(pde_t *pgdir, uintptr_t start, uintptr_t end) // 取消映射指定虚拟地址范围内的页面
 {
-    free_pages(kva2page((void *)(proc->kstack)), KSTACKPAGE);
+    assert(start % PGSIZE == 0 && end % PGSIZE == 0); // 确保开始和结束地址是页对齐的。
+    assert(USER_ACCESS(start, end));                  // 确保范围在用户空间内。
+
+    do // 使用循环逐个处理页表项
+    {
+        pte_t *ptep = get_pte(pgdir, start, 0); // 获取虚拟地址 start 对应的页表项指针 ptep
+        if (ptep == NULL)                       // 如果 ptep 为空，说明对应的页表不存在，将 start 向下对齐到下一个页表的开始地址。
+        {
+            start = ROUNDDOWN(start + PTSIZE, PTSIZE);
+            continue;
+        }
+        if (*ptep != 0) // 如果 ptep 不为空，则调用 page_remove_pte 函数，删除虚拟地址 start 对应的页表项，并可能释放相关的物理页。
+        {
+            page_remove_pte(pgdir, start, ptep);
+        }
+        start += PGSIZE; // 将 start 增加一个页面大小，直到处理完整个范围。
+    } while (start != 0 && start < end);
 }
 
-// setup_pgdir - alloc one page as PDT
-static int
-setup_pgdir(struct mm_struct *mm)
+void exit_range(pde_t *pgdir, uintptr_t start, uintptr_t end) // 在进程退出时释放相关的页表和物理页
 {
-    struct Page *page;
-    if ((page = alloc_page()) == NULL)
+    assert(start % PGSIZE == 0 && end % PGSIZE == 0); // 获取虚拟地址 start 对应的页表项指针 ptep
+    assert(USER_ACCESS(start, end));                  // 如果 ptep 为空，说明对应的页表不存在，将 start 向下对齐到下一个页表的开始地址。
+
+    uintptr_t d1start, d0start;
+    int free_pt, free_pd0;
+    pde_t *pd0, *pt, pde1, pde0;
+    d1start = ROUNDDOWN(start, PDSIZE);
+    d0start = ROUNDDOWN(start, PTSIZE);
+    do
+    {
+        // level 1 page directory entry
+        pde1 = pgdir[PDX1(d1start)]; // 找到虚拟地址 start 所在的页表目录项 pde1。
+        // if there is a valid entry, get into level 0
+        // and try to free all page tables pointed to by
+        // all valid entries in level 0 page directory,
+        // then try to free this level 0 page directory
+        // and update level 1 entry
+        if (pde1 & PTE_V) // 如果 pde1 有效，表示有相关的页表，进入下一层循环。
+        {
+            pd0 = page2kva(pde2page(pde1));
+            // try to free all page tables
+            free_pd0 = 1;
+            do
+            {
+                pde0 = pd0[PDX0(d0start)]; // 找到页表 pd0，并尝试释放其包含的所有页表项
+                if (pde0 & PTE_V)
+                {
+                    pt = page2kva(pde2page(pde0));
+                    // try to free page table
+                    free_pt = 1;
+                    for (int i = 0; i < NPTEENTRY; i++)
+                        if (pt[i] & PTE_V)
+                        {
+                            free_pt = 0;
+                            break;
+                        }
+                    // free it only when all entry are already invalid
+                    if (free_pt)
+                    {
+                        free_page(pde2page(pde0));
+                        pd0[PDX0(d0start)] = 0;
+                    }
+                }
+                else
+                    free_pd0 = 0;
+                d0start += PTSIZE;
+            } while (d0start != 0 && d0start < d1start + PDSIZE && d0start < end);
+            // free level 0 page directory only when all pde0s in it are already invalid
+            if (free_pd0) // 如果页表项都被释放，则尝试释放该页表和更新相应的页表目录项
+            {
+                free_page(pde2page(pde1));
+                pgdir[PDX1(d1start)] = 0;
+            }
+        }
+        d1start += PDSIZE; // 将 start 向前移动到下一个页表目录的开始地址，重复整个过程，直到处理完整个范围。
+        d0start = d1start;
+    } while (d1start != 0 && d1start < end);
+}
+/* copy_range - copy content of memory (start, end) of one process A to another
+ * process B
+ * @to:    the addr of process B's Page Directory
+ * @from:  the addr of process A's Page Directory
+ * @share: flags to indicate to dup OR share. We just use dup method, so it
+ * didn't be used.
+ *
+ * CALL GRAPH: copy_mm-->dup_mmap-->copy_range
+ */
+int copy_range(pde_t *to, pde_t *from, uintptr_t start, uintptr_t end,
+               bool share) // 在两个不同的页表之间复制一定范围的内存内容，从进程 A 的页表复制到进程 B 的页表
+{
+    assert(start % PGSIZE == 0 && end % PGSIZE == 0); // 获取虚拟地址 start 对应的页表项指针 ptep
+    assert(USER_ACCESS(start, end));                  // 如果 ptep 为空，说明对应的页表不存在，将 start 向下对齐到下一个页表的开始地址。
+    // copy content by page unit.
+    do // 通过循环，逐个处理给定范围内的虚拟地址对应的页表项。
+    {
+        // call get_pte to find process A's pte according to the addr start
+        pte_t *ptep = get_pte(from, start, 0), *nptep; // 调用 get_pte 函数，从进程 A 的页表中获取虚拟地址 start 对应的页表项指针 ptep
+        if (ptep == NULL)                              // 如果 ptep 为空，说明源页表项不存在，将 start 向下对齐到下一个页表的开始地址。
+        {
+            start = ROUNDDOWN(start + PTSIZE, PTSIZE);
+            continue;
+        }
+        // call get_pte to find process B's pte according to the addr start. If
+        // pte is NULL, just alloc a PT
+        if (*ptep & PTE_V) // 如果 ptep 不为空，表示有有效的源页表项，继续执行下面的步骤。
+        {
+            // 调用 get_pte 函数，从进程 B 的页表中获取虚拟地址 start 对应的页表项指针 nptep
+            if ((nptep = get_pte(to, start, 1)) == NULL) // 如果 nptep 为空，说明目标页表项不存在，需要分配一个页表。
+            {
+                return -E_NO_MEM;
+            }
+            uint32_t perm = (*ptep & PTE_USER);
+            // get page from ptep
+            struct Page *page = pte2page(*ptep);
+            // alloc a page for process B
+            struct Page *npage = alloc_page();
+            assert(page != NULL);
+            assert(npage != NULL);
+            int ret = 0;
+            /* LAB5:EXERCISE2 YOUR CODE ：2113414
+             * replicate content of page to npage, build the map of phy addr of
+             * nage with the linear addr start
+             *
+             * Some Useful MACROs and DEFINEs, you can use them in below
+             * implementation.
+             * MACROs or Functions:
+             *    page2kva(struct Page *page): return the kernel vritual addr of
+             * memory which page managed (SEE pmm.h)
+             *    page_insert: build the map of phy addr of an Page with the
+             * linear addr la
+             *    memcpy: typical memory copy function
+             *
+             * (1) find src_kvaddr: the kernel virtual address of page
+             * (2) find dst_kvaddr: the kernel virtual address of npage
+             * (3) memory copy from src_kvaddr to dst_kvaddr, size is PGSIZE
+             * (4) build the map of phy addr of  nage with the linear addr start
+             * 获取源页表项对应的物理页和目标页表项对应的物理页。
+                使用 memcpy 函数，将源页的内容复制到目标页。
+                使用 page_insert 函数，建立目标页的物理地址与线性地址的映射关系
+             */
+            void *kva_src = page2kva(page);
+            // 获取目标页面所在的虚拟地址
+            void *kva_dst = page2kva(npage);
+            // 复制目标页面的数据
+            memcpy(kva_dst, kva_src, PGSIZE);
+            // 将该页面设置至对应的PTE中
+            ret = page_insert(to, npage, start, perm);
+
+            assert(ret == 0);
+        }
+        start += PGSIZE; // 将 start 增加一个页面大小，以处理下一个虚拟页面
+    } while (start != 0 && start < end);
+    return 0;
+}
+
+// page_remove - free an Page which is related linear address la and has an
+// validated pte
+void page_remove(pde_t *pgdir, uintptr_t la)
+{
+    pte_t *ptep = get_pte(pgdir, la, 0);
+    if (ptep != NULL)
+    {
+        page_remove_pte(pgdir, la, ptep);
+    }
+}
+
+// page_insert - build the map of phy addr of an Page with the linear addr la
+// paramemters:
+//  pgdir: the kernel virtual base address of PDT
+//  page:  the Page which need to map
+//  la:    the linear address need to map
+//  perm:  the permission of this Page which is setted in related pte
+// return value: always 0
+// note: PT is changed, so the TLB need to be invalidate
+int page_insert(pde_t *pgdir, struct Page *page, uintptr_t la, uint32_t perm)
+{
+    pte_t *ptep = get_pte(pgdir, la, 1);
+    if (ptep == NULL)
     {
         return -E_NO_MEM;
     }
-    pde_t *pgdir = page2kva(page);
-    memcpy(pgdir, boot_pgdir, PGSIZE);
-
-    mm->pgdir = pgdir;
+    page_ref_inc(page);
+    if (*ptep & PTE_V)
+    {
+        struct Page *p = pte2page(*ptep);
+        if (p == page)
+        {
+            page_ref_dec(page);
+        }
+        else
+        {
+            page_remove_pte(pgdir, la, ptep);
+        }
+    }
+    *ptep = pte_create(page2ppn(page), PTE_V | perm);
+    tlb_invalidate(pgdir, la);
     return 0;
 }
 
-// put_pgdir - free the memory space of PDT
-static void
-put_pgdir(struct mm_struct *mm)
+// invalidate a TLB entry, but only if the page tables being
+// edited are the ones currently in use by the processor.
+void tlb_invalidate(pde_t *pgdir, uintptr_t la)
 {
-    free_page(kva2page(mm->pgdir));
+    asm volatile("sfence.vma %0" : : "r"(la));
 }
 
-// copy_mm - process "proc" duplicate OR share process "current"'s mm according clone_flags
-//         - if clone_flags & CLONE_VM, then "share" ; else "duplicate"
-static int
-copy_mm(uint32_t clone_flags, struct proc_struct *proc)
+// pgdir_alloc_page - call alloc_page & page_insert functions to
+//                  - allocate a page size memory & setup an addr map
+//                  - pa<->la with linear address la and the PDT pgdir
+struct Page *pgdir_alloc_page(pde_t *pgdir, uintptr_t la, uint32_t perm)
 {
-    struct mm_struct *mm, *oldmm = current->mm;
+    struct Page *page = alloc_page();
+    if (page != NULL)
+    {
+        if (page_insert(pgdir, page, la, perm) != 0)
+        {
+            free_page(page);
+            return NULL;
+        }
+        if (swap_init_ok)
+        {
+            if (check_mm_struct != NULL)
+            {
+                swap_map_swappable(check_mm_struct, la, page, 0);
+                page->pra_vaddr = la;
+                assert(page_ref(page) == 1);
+                // cprintf("get No. %d  page: pra_vaddr %x, pra_link.prev %x,
+                // pra_link_next %x in pgdir_alloc_page\n", (page-pages),
+                // page->pra_vaddr,page->pra_page_link.prev,
+                // page->pra_page_link.next);
+            }
+            else
+            { // now current is existed, should fix it in the future
+              // swap_map_swappable(current->mm, la, page, 0);
+              // page->pra_vaddr=la;
+              // assert(page_ref(page) == 1);
+              // panic("pgdir_alloc_page: no pages. now current is existed,
+              // should fix it in the future\n");
+            }
+        }
+    }
 
-    /* current is a kernel thread */
-    if (oldmm == NULL)
+    return page;
+}
+
+static void check_alloc_page(void)
+{
+    pmm_manager->check();
+    cprintf("check_alloc_page() succeeded!\n");
+}
+
+static void check_pgdir(void)
+{
+    // assert(npage <= KMEMSIZE / PGSIZE);
+    // The memory starts at 2GB in RISC-V
+    // so npage is always larger than KMEMSIZE / PGSIZE
+    size_t nr_free_store;
+
+    nr_free_store = nr_free_pages();
+
+    assert(npage <= KERNTOP / PGSIZE);
+    assert(boot_pgdir != NULL && (uint32_t)PGOFF(boot_pgdir) == 0);
+    assert(get_page(boot_pgdir, 0x0, NULL) == NULL);
+
+    struct Page *p1, *p2;
+    p1 = alloc_page();
+    assert(page_insert(boot_pgdir, p1, 0x0, 0) == 0);
+
+    pte_t *ptep;
+    assert((ptep = get_pte(boot_pgdir, 0x0, 0)) != NULL);
+    assert(pte2page(*ptep) == p1);
+    assert(page_ref(p1) == 1);
+
+    ptep = (pte_t *)KADDR(PDE_ADDR(boot_pgdir[0]));
+    ptep = (pte_t *)KADDR(PDE_ADDR(ptep[0])) + 1;
+    assert(get_pte(boot_pgdir, PGSIZE, 0) == ptep);
+
+    p2 = alloc_page();
+    assert(page_insert(boot_pgdir, p2, PGSIZE, PTE_U | PTE_W) == 0);
+    assert((ptep = get_pte(boot_pgdir, PGSIZE, 0)) != NULL);
+    assert(*ptep & PTE_U);
+    assert(*ptep & PTE_W);
+    assert(boot_pgdir[0] & PTE_U);
+    assert(page_ref(p2) == 1);
+
+    assert(page_insert(boot_pgdir, p1, PGSIZE, 0) == 0);
+    assert(page_ref(p1) == 2);
+    assert(page_ref(p2) == 0);
+    assert((ptep = get_pte(boot_pgdir, PGSIZE, 0)) != NULL);
+    assert(pte2page(*ptep) == p1);
+    assert((*ptep & PTE_U) == 0);
+
+    page_remove(boot_pgdir, 0x0);
+    assert(page_ref(p1) == 1);
+    assert(page_ref(p2) == 0);
+
+    page_remove(boot_pgdir, PGSIZE);
+    assert(page_ref(p1) == 0);
+    assert(page_ref(p2) == 0);
+
+    assert(page_ref(pde2page(boot_pgdir[0])) == 1);
+
+    pde_t *pd1 = boot_pgdir, *pd0 = page2kva(pde2page(boot_pgdir[0]));
+    free_page(pde2page(pd0[0]));
+    free_page(pde2page(pd1[0]));
+    boot_pgdir[0] = 0;
+    flush_tlb();
+
+    assert(nr_free_store == nr_free_pages());
+
+    cprintf("check_pgdir() succeeded!\n");
+}
+
+static void check_boot_pgdir(void)
+{
+    size_t nr_free_store;
+    pte_t *ptep;
+    int i;
+
+    nr_free_store = nr_free_pages();
+
+    for (i = ROUNDDOWN(KERNBASE, PGSIZE); i < npage * PGSIZE; i += PGSIZE)
+    {
+        assert((ptep = get_pte(boot_pgdir, (uintptr_t)KADDR(i), 0)) != NULL);
+        assert(PTE_ADDR(*ptep) == i);
+    }
+
+    assert(boot_pgdir[0] == 0);
+
+    struct Page *p;
+    p = alloc_page();
+    assert(page_insert(boot_pgdir, p, 0x100, PTE_W | PTE_R) == 0);
+    assert(page_ref(p) == 1);
+    assert(page_insert(boot_pgdir, p, 0x100 + PGSIZE, PTE_W | PTE_R) == 0);
+    assert(page_ref(p) == 2);
+
+    const char *str = "ucore: Hello world!!";
+    strcpy((void *)0x100, str);
+    assert(strcmp((void *)0x100, (void *)(0x100 + PGSIZE)) == 0);
+
+    *(char *)(page2kva(p) + 0x100) = '\0';
+    assert(strlen((const char *)0x100) == 0);
+
+    pde_t *pd1 = boot_pgdir, *pd0 = page2kva(pde2page(boot_pgdir[0]));
+    free_page(p);
+    free_page(pde2page(pd0[0]));
+    free_page(pde2page(pd1[0]));
+    boot_pgdir[0] = 0;
+    flush_tlb();
+
+    assert(nr_free_store == nr_free_pages());
+
+    cprintf("check_boot_pgdir() succeeded!\n");
+}
+
+// perm2str - use string 'u,r,w,-' to present the permission
+static const char *perm2str(int perm)
+{
+    static char str[4];
+    str[0] = (perm & PTE_U) ? 'u' : '-';
+    str[1] = 'r';
+    str[2] = (perm & PTE_W) ? 'w' : '-';
+    str[3] = '\0';
+    return str;
+}
+
+// get_pgtable_items - In [left, right] range of PDT or PT, find a continuous
+// linear addr space
+//                  - (left_store*X_SIZE~right_store*X_SIZE) for PDT or PT
+//                  - X_SIZE=PTSIZE=4M, if PDT; X_SIZE=PGSIZE=4K, if PT
+// paramemters:
+//  left:        no use ???
+//  right:       the high side of table's range
+//  start:       the low side of table's range
+//  table:       the beginning addr of table
+//  left_store:  the pointer of the high side of table's next range
+//  right_store: the pointer of the low side of table's next range
+// return value: 0 - not a invalid item range, perm - a valid item range with
+// perm permission
+static int get_pgtable_items(size_t left, size_t right, size_t start,
+                             uintptr_t *table, size_t *left_store,
+                             size_t *right_store)
+{
+    if (start >= right)
     {
         return 0;
     }
-    if (clone_flags & CLONE_VM)
+    while (start < right && !(table[start] & PTE_V))
     {
-        mm = oldmm;
-        goto good_mm;
+        start++;
     }
-    int ret = -E_NO_MEM;
-    if ((mm = mm_create()) == NULL)
+    if (start < right)
     {
-        goto bad_mm;
+        if (left_store != NULL)
+        {
+            *left_store = start;
+        }
+        int perm = (table[start++] & PTE_USER);
+        while (start < right && (table[start] & PTE_USER) == perm)
+        {
+            start++;
+        }
+        if (right_store != NULL)
+        {
+            *right_store = start;
+        }
+        return perm;
     }
-    if (setup_pgdir(mm) != 0)
-    {
-        goto bad_pgdir_cleanup_mm;
-    }
-    lock_mm(oldmm);
-    {
-        ret = dup_mmap(mm, oldmm);
-    }
-    unlock_mm(oldmm);
-
-    if (ret != 0)
-    {
-        goto bad_dup_cleanup_mmap;
-    }
-
-good_mm:
-    mm_count_inc(mm);
-    proc->mm = mm;
-    proc->cr3 = PADDR(mm->pgdir);
     return 0;
-bad_dup_cleanup_mmap:
-    exit_mmap(mm);
-    put_pgdir(mm);
-bad_pgdir_cleanup_mm:
-    mm_destroy(mm);
-bad_mm:
-    return ret;
-}
-
-// copy_thread - setup the trapframe on the  process's kernel stack top and
-//             - setup the kernel entry point and stack of process
-static void
-copy_thread(struct proc_struct *proc, uintptr_t esp, struct trapframe *tf)
-{
-    proc->tf = (struct trapframe *)(proc->kstack + KSTACKSIZE) - 1;
-    *(proc->tf) = *tf;
-
-    // Set a0 to 0 so a child process knows it's just forked
-    proc->tf->gpr.a0 = 0;
-    proc->tf->gpr.sp = (esp == 0) ? (uintptr_t)proc->tf : esp;
-
-    proc->context.ra = (uintptr_t)forkret;
-    proc->context.sp = (uintptr_t)(proc->tf);
-}
-
-/* do_fork -     parent process for a new child process
- * @clone_flags: used to guide how to clone the child process
- * @stack:       the parent's user stack pointer. if stack==0, It means to fork a kernel thread.
- * @tf:          the trapframe info, which will be copied to child process's proc->tf
- */
-int do_fork(uint32_t clone_flags, uintptr_t stack, struct trapframe *tf)
-{
-    int ret = -E_NO_FREE_PROC;
-    struct proc_struct *proc;
-    if (nr_process >= MAX_PROCESS)
-    {
-        goto fork_out;
-    }
-    ret = -E_NO_MEM;
-    // LAB4:EXERCISE2 YOUR CODE
-    /*
-     * Some Useful MACROs, Functions and DEFINEs, you can use them in below implementation.
-     * MACROs or Functions:
-     *   alloc_proc:   create a proc struct and init fields (lab4:exercise1)
-     *   setup_kstack: alloc pages with size KSTACKPAGE as process kernel stack
-     *   copy_mm:      process "proc" duplicate OR share process "current"'s mm according clone_flags
-     *                 if clone_flags & CLONE_VM, then "share" ; else "duplicate"
-     *   copy_thread:  setup the trapframe on the  process's kernel stack top and
-     *                 setup the kernel entry point and stack of process
-     *   hash_proc:    add proc into proc hash_list
-     *   get_pid:      alloc a unique pid for process
-     *   wakeup_proc:  set proc->state = PROC_RUNNABLE
-     * VARIABLES:
-     *   proc_list:    the process set's list
-     *   nr_process:   the number of process set
-     */
-
-    //    1. call alloc_proc to allocate a proc_struct
-    //    2. call setup_kstack to allocate a kernel stack for child process
-    //    3. call copy_mm to dup OR share mm according clone_flag
-    //    4. call copy_thread to setup tf & context in proc_struct
-    //    5. insert proc_struct into hash_list && proc_list
-    //    6. call wakeup_proc to make the new child process RUNNABLE
-    //    7. set ret vaule using child proc's pid
-
-    // LAB5 YOUR CODE : 2113414 (update LAB4 steps)
-    // TIPS: you should modify your written code in lab4(step1 and step5), not add more code.
-    /* Some Functions
-     *    set_links:  set the relation links of process.  ALSO SEE: remove_links:  lean the relation links of process
-     *    -------------------
-     *    update step 1: set child proc's parent to current process, make sure current process's wait_state is 0
-     *    update step 5: insert proc_struct into hash_list && proc_list, set the relation links of process
-     */
-    if ((proc = alloc_proc()) == NULL)
-        goto fork_out;
-    // 设置当前进程的父进程为当前进程
-    proc->parent = current;
-    // Lab5: 确保当前进程的wait状态为空
-    assert(current->wait_state == 0);
-    if (setup_kstack(proc) != 0)
-        goto bad_fork_cleanup_proc;
-    if (copy_mm(clone_flags, proc) != 0)
-        goto bad_fork_cleanup_kstack;
-    copy_thread(proc, stack, tf);
-    bool intr_flag;
-    local_intr_save(intr_flag);
-    {
-        proc->pid = get_pid();
-        hash_proc(proc);
-        // Lab5: 设置进程间的关系
-        set_links(proc);
-    }
-    local_intr_restore(intr_flag);
-    wakeup_proc(proc);
-    ret = proc->pid;
-
-fork_out:
-    return ret;
-
-bad_fork_cleanup_kstack:
-    put_kstack(proc);
-bad_fork_cleanup_proc:
-    kfree(proc);
-    goto fork_out;
-}
-
-// do_exit - called by sys_exit
-//   1. call exit_mmap & put_pgdir & mm_destroy to free the almost all memory space of process
-//   2. set process' state as PROC_ZOMBIE, then call wakeup_proc(parent) to ask parent reclaim itself.
-//   3. call scheduler to switch to other process
-int do_exit(int error_code)
-{
-    if (current == idleproc)
-    {
-        panic("idleproc exit.\n");
-    }
-    if (current == initproc)
-    {
-        panic("initproc exit.\n");
-    }
-    struct mm_struct *mm = current->mm;
-    if (mm != NULL)
-    {
-        lcr3(boot_cr3);
-        if (mm_count_dec(mm) == 0)
-        {
-            exit_mmap(mm);
-            put_pgdir(mm);
-            mm_destroy(mm);
-        }
-        current->mm = NULL;
-    }
-    current->state = PROC_ZOMBIE;
-    current->exit_code = error_code;
-    bool intr_flag;
-    struct proc_struct *proc;
-    local_intr_save(intr_flag);
-    {
-        proc = current->parent;
-        if (proc->wait_state == WT_CHILD)
-        {
-            wakeup_proc(proc);
-        }
-        while (current->cptr != NULL)
-        {
-            proc = current->cptr;
-            current->cptr = proc->optr;
-
-            proc->yptr = NULL;
-            if ((proc->optr = initproc->cptr) != NULL)
-            {
-                initproc->cptr->yptr = proc;
-            }
-            proc->parent = initproc;
-            initproc->cptr = proc;
-            if (proc->state == PROC_ZOMBIE)
-            {
-                if (initproc->wait_state == WT_CHILD)
-                {
-                    wakeup_proc(initproc);
-                }
-            }
-        }
-    }
-    local_intr_restore(intr_flag);
-    schedule();
-    panic("do_exit will not return!! %d.\n", current->pid);
-}
-
-/* load_icode - load the content of binary program(ELF format) as the new content of current process
- * @binary:  the memory addr of the content of binary program
- * @size:  the size of the content of binary program
- */
-static int
-load_icode(unsigned char *binary, size_t size)
-{
-    if (current->mm != NULL)
-    {
-        panic("load_icode: current->mm must be empty.\n");
-    }
-
-    int ret = -E_NO_MEM;
-    struct mm_struct *mm;
-    //(1) create a new mm for current process
-    if ((mm = mm_create()) == NULL)
-    {
-        goto bad_mm;
-    }
-    //(2) create a new PDT, and mm->pgdir= kernel virtual addr of PDT
-    if (setup_pgdir(mm) != 0)
-    {
-        goto bad_pgdir_cleanup_mm;
-    }
-    //(3) copy TEXT/DATA section, build BSS parts in binary to memory space of process
-    struct Page *page;
-    //(3.1) get the file header of the bianry program (ELF format)
-    struct elfhdr *elf = (struct elfhdr *)binary;
-    //(3.2) get the entry of the program section headers of the bianry program (ELF format)
-    struct proghdr *ph = (struct proghdr *)(binary + elf->e_phoff);
-    //(3.3) This program is valid?
-    if (elf->e_magic != ELF_MAGIC)
-    {
-        ret = -E_INVAL_ELF;
-        goto bad_elf_cleanup_pgdir;
-    }
-
-    uint32_t vm_flags, perm;
-    struct proghdr *ph_end = ph + elf->e_phnum;
-    for (; ph < ph_end; ph++)
-    {
-        //(3.4) find every program section headers
-        if (ph->p_type != ELF_PT_LOAD)
-        {
-            continue;
-        }
-        if (ph->p_filesz > ph->p_memsz)
-        {
-            ret = -E_INVAL_ELF;
-            goto bad_cleanup_mmap;
-        }
-        if (ph->p_filesz == 0)
-        {
-            // continue ;
-        }
-        //(3.5) call mm_map fun to setup the new vma ( ph->p_va, ph->p_memsz)
-        vm_flags = 0, perm = PTE_U | PTE_V;
-        if (ph->p_flags & ELF_PF_X)
-            vm_flags |= VM_EXEC;
-        if (ph->p_flags & ELF_PF_W)
-            vm_flags |= VM_WRITE;
-        if (ph->p_flags & ELF_PF_R)
-            vm_flags |= VM_READ;
-        // modify the perm bits here for RISC-V
-        if (vm_flags & VM_READ)
-            perm |= PTE_R;
-        if (vm_flags & VM_WRITE)
-            perm |= (PTE_W | PTE_R);
-        if (vm_flags & VM_EXEC)
-            perm |= PTE_X;
-        if ((ret = mm_map(mm, ph->p_va, ph->p_memsz, vm_flags, NULL)) != 0)
-        {
-            goto bad_cleanup_mmap;
-        }
-        unsigned char *from = binary + ph->p_offset;
-        size_t off, size;
-        uintptr_t start = ph->p_va, end, la = ROUNDDOWN(start, PGSIZE);
-
-        ret = -E_NO_MEM;
-
-        //(3.6) alloc memory, and  copy the contents of every program section (from, from+end) to process's memory (la, la+end)
-        end = ph->p_va + ph->p_filesz;
-        //(3.6.1) copy TEXT/DATA section of bianry program
-        while (start < end)
-        {
-            if ((page = pgdir_alloc_page(mm->pgdir, la, perm)) == NULL)
-            {
-                goto bad_cleanup_mmap;
-            }
-            off = start - la, size = PGSIZE - off, la += PGSIZE;
-            if (end < la)
-            {
-                size -= la - end;
-            }
-            memcpy(page2kva(page) + off, from, size);
-            start += size, from += size;
-        }
-
-        //(3.6.2) build BSS section of binary program
-        end = ph->p_va + ph->p_memsz;
-        if (start < la)
-        {
-            /* ph->p_memsz == ph->p_filesz */
-            if (start == end)
-            {
-                continue;
-            }
-            off = start + PGSIZE - la, size = PGSIZE - off;
-            if (end < la)
-            {
-                size -= la - end;
-            }
-            memset(page2kva(page) + off, 0, size);
-            start += size;
-            assert((end < la && start == end) || (end >= la && start == la));
-        }
-        while (start < end)
-        {
-            if ((page = pgdir_alloc_page(mm->pgdir, la, perm)) == NULL)
-            {
-                goto bad_cleanup_mmap;
-            }
-            off = start - la, size = PGSIZE - off, la += PGSIZE;
-            if (end < la)
-            {
-                size -= la - end;
-            }
-            memset(page2kva(page) + off, 0, size);
-            start += size;
-        }
-    }
-    //(4) build user stack memory
-    vm_flags = VM_READ | VM_WRITE | VM_STACK;
-    if ((ret = mm_map(mm, USTACKTOP - USTACKSIZE, USTACKSIZE, vm_flags, NULL)) != 0)
-    {
-        goto bad_cleanup_mmap;
-    }
-    assert(pgdir_alloc_page(mm->pgdir, USTACKTOP - PGSIZE, PTE_USER) != NULL);
-    assert(pgdir_alloc_page(mm->pgdir, USTACKTOP - 2 * PGSIZE, PTE_USER) != NULL);
-    assert(pgdir_alloc_page(mm->pgdir, USTACKTOP - 3 * PGSIZE, PTE_USER) != NULL);
-    assert(pgdir_alloc_page(mm->pgdir, USTACKTOP - 4 * PGSIZE, PTE_USER) != NULL);
-
-    //(5) set current process's mm, sr3, and set CR3 reg = physical addr of Page Directory
-    mm_count_inc(mm);
-    current->mm = mm;
-    current->cr3 = PADDR(mm->pgdir);
-    lcr3(PADDR(mm->pgdir));
-
-    //(6) setup trapframe for user environment
-    struct trapframe *tf = current->tf;
-    // Keep sstatus
-    uintptr_t sstatus = tf->status;
-    memset(tf, 0, sizeof(struct trapframe));
-    /* LAB5:EXERCISE1 YOUR CODE 2113414
-     * should set tf->gpr.sp, tf->epc, tf->status
-     * NOTICE: If we set trapframe correctly, then the user level process can return to USER MODE from kernel. So
-     *          tf->gpr.sp should be user stack top (the value of sp)
-     *          tf->epc should be entry point of user program (the value of sepc)
-     *          tf->status should be appropriate for user program (the value of sstatus)
-     *          hint: check meaning of SPP, SPIE in SSTATUS, use them by SSTATUS_SPP, SSTATUS_SPIE(defined in risv.h)
-     */
-    tf->gpr.sp = USTACKTOP;
-    tf->epc = elf->e_entry;
-    tf->status = (~SSTATUS_SPP | SSTATUS_SPIE) & ~SSTATUS_SIE;
-    ret = 0;
-out:
-    return ret;
-bad_cleanup_mmap:
-    exit_mmap(mm);
-bad_elf_cleanup_pgdir:
-    put_pgdir(mm);
-bad_pgdir_cleanup_mm:
-    mm_destroy(mm);
-bad_mm:
-    goto out;
-}
-
-// do_execve - call exit_mmap(mm)&put_pgdir(mm) to reclaim memory space of current process
-//           - call load_icode to setup new memory space accroding binary prog.
-int do_execve(const char *name, size_t len, unsigned char *binary, size_t size)
-{
-    struct mm_struct *mm = current->mm;
-    if (!user_mem_check(mm, (uintptr_t)name, len, 0))
-    {
-        return -E_INVAL;
-    }
-    if (len > PROC_NAME_LEN)
-    {
-        len = PROC_NAME_LEN;
-    }
-
-    char local_name[PROC_NAME_LEN + 1];
-    memset(local_name, 0, sizeof(local_name));
-    memcpy(local_name, name, len);
-
-    if (mm != NULL)
-    {
-        cputs("mm != NULL");
-        lcr3(boot_cr3);
-        if (mm_count_dec(mm) == 0)
-        {
-            exit_mmap(mm);
-            put_pgdir(mm);
-            mm_destroy(mm);
-        }
-        current->mm = NULL;
-    }
-    int ret;
-    if ((ret = load_icode(binary, size)) != 0)
-    {
-        goto execve_exit;
-    }
-    set_proc_name(current, local_name);
-    return 0;
-
-execve_exit:
-    do_exit(ret);
-    panic("already exit: %e.\n", ret);
-}
-
-// do_yield - ask the scheduler to reschedule
-int do_yield(void)
-{
-    current->need_resched = 1;
-    return 0;
-}
-
-// do_wait - wait one OR any children with PROC_ZOMBIE state, and free memory space of kernel stack
-//         - proc struct of this child.
-// NOTE: only after do_wait function, all resources of the child proces are free.
-int do_wait(int pid, int *code_store)
-{
-    struct mm_struct *mm = current->mm;
-    if (code_store != NULL)
-    {
-        if (!user_mem_check(mm, (uintptr_t)code_store, sizeof(int), 1))
-        {
-            return -E_INVAL;
-        }
-    }
-
-    struct proc_struct *proc;
-    bool intr_flag, haskid;
-repeat:
-    haskid = 0;
-    if (pid != 0)
-    {
-        proc = find_proc(pid);
-        if (proc != NULL && proc->parent == current)
-        {
-            haskid = 1;
-            if (proc->state == PROC_ZOMBIE)
-            {
-                goto found;
-            }
-        }
-    }
-    else
-    {
-        proc = current->cptr;
-        for (; proc != NULL; proc = proc->optr)
-        {
-            haskid = 1;
-            if (proc->state == PROC_ZOMBIE)
-            {
-                goto found;
-            }
-        }
-    }
-    if (haskid)
-    {
-        current->state = PROC_SLEEPING;
-        current->wait_state = WT_CHILD;
-        schedule();
-        if (current->flags & PF_EXITING)
-        {
-            do_exit(-E_KILLED);
-        }
-        goto repeat;
-    }
-    return -E_BAD_PROC;
-
-found:
-    if (proc == idleproc || proc == initproc)
-    {
-        panic("wait idleproc or initproc.\n");
-    }
-    if (code_store != NULL)
-    {
-        *code_store = proc->exit_code;
-    }
-    local_intr_save(intr_flag);
-    {
-        unhash_proc(proc);
-        remove_links(proc);
-    }
-    local_intr_restore(intr_flag);
-    put_kstack(proc);
-    kfree(proc);
-    return 0;
-}
-
-// do_kill - kill process with pid by set this process's flags with PF_EXITING
-int do_kill(int pid)
-{
-    struct proc_struct *proc;
-    if ((proc = find_proc(pid)) != NULL)
-    {
-        if (!(proc->flags & PF_EXITING))
-        {
-            proc->flags |= PF_EXITING;
-            if (proc->wait_state & WT_INTERRUPTED)
-            {
-                wakeup_proc(proc);
-            }
-            return 0;
-        }
-        return -E_KILLED;
-    }
-    return -E_INVAL;
-}
-
-// kernel_execve - do SYS_exec syscall to exec a user program called by user_main kernel_thread
-static int
-kernel_execve(const char *name, unsigned char *binary, size_t size)
-{
-    int64_t ret = 0, len = strlen(name);
-    //   ret = do_execve(name, len, binary, size);
-    asm volatile(
-        "li a0, %1\n"
-        "lw a1, %2\n"
-        "lw a2, %3\n"
-        "lw a3, %4\n"
-        "lw a4, %5\n"
-        "li a7, 10\n"
-        "ebreak\n"
-        "sw a0, %0\n"
-        : "=m"(ret)
-        : "i"(SYS_exec), "m"(name), "m"(len), "m"(binary), "m"(size)
-        : "memory");
-    cprintf("ret = %d\n", ret);
-    return ret;
-}
-
-#define __KERNEL_EXECVE(name, binary, size) ({           \
-    cprintf("kernel_execve: pid = %d, name = \"%s\".\n", \
-            current->pid, name);                         \
-    kernel_execve(name, binary, (size_t)(size));         \
-})
-
-#define KERNEL_EXECVE(x) ({                                    \
-    extern unsigned char _binary_obj___user_##x##_out_start[], \
-        _binary_obj___user_##x##_out_size[];                   \
-    __KERNEL_EXECVE(#x, _binary_obj___user_##x##_out_start,    \
-                    _binary_obj___user_##x##_out_size);        \
-})
-
-#define __KERNEL_EXECVE2(x, xstart, xsize) ({   \
-    extern unsigned char xstart[], xsize[];     \
-    __KERNEL_EXECVE(#x, xstart, (size_t)xsize); \
-})
-
-#define KERNEL_EXECVE2(x, xstart, xsize) __KERNEL_EXECVE2(x, xstart, xsize)
-
-// user_main - kernel thread used to exec a user program
-static int
-user_main(void *arg)
-{
-#ifdef TEST
-    KERNEL_EXECVE2(TEST, TESTSTART, TESTSIZE);
-#else
-    KERNEL_EXECVE(exit);
-#endif
-    panic("user_main execve failed.\n");
-}
-
-// init_main - the second kernel thread used to create user_main kernel threads
-static int
-init_main(void *arg)
-{
-    size_t nr_free_pages_store = nr_free_pages();
-    size_t kernel_allocated_store = kallocated();
-
-    int pid = kernel_thread(user_main, NULL, 0);
-    if (pid <= 0)
-    {
-        panic("create user_main failed.\n");
-    }
-
-    while (do_wait(0, NULL) == 0)
-    {
-        schedule();
-    }
-
-    cprintf("all user-mode processes have quit.\n");
-    assert(initproc->cptr == NULL && initproc->yptr == NULL && initproc->optr == NULL);
-    assert(nr_process == 2);
-    assert(list_next(&proc_list) == &(initproc->list_link));
-    assert(list_prev(&proc_list) == &(initproc->list_link));
-
-    cprintf("init check memory pass.\n");
-    return 0;
-}
-
-// proc_init - set up the first kernel thread idleproc "idle" by itself and
-//           - create the second kernel thread init_main
-void proc_init(void)
-{
-    int i;
-
-    list_init(&proc_list);
-    for (i = 0; i < HASH_LIST_SIZE; i++)
-    {
-        list_init(hash_list + i);
-    }
-
-    if ((idleproc = alloc_proc()) == NULL)
-    {
-        panic("cannot alloc idleproc.\n");
-    }
-
-    idleproc->pid = 0;
-    idleproc->state = PROC_RUNNABLE;
-    idleproc->kstack = (uintptr_t)bootstack;
-    idleproc->need_resched = 1;
-    set_proc_name(idleproc, "idle");
-    nr_process++;
-
-    current = idleproc;
-
-    int pid = kernel_thread(init_main, NULL, 0);
-    if (pid <= 0)
-    {
-        panic("create init_main failed.\n");
-    }
-
-    initproc = find_proc(pid);
-    set_proc_name(initproc, "init");
-
-    assert(idleproc != NULL && idleproc->pid == 0);
-    assert(initproc != NULL && initproc->pid == 1);
-}
-
-// cpu_idle - at the end of kern_init, the first kernel thread idleproc will do below works
-void cpu_idle(void)
-{
-    while (1)
-    {
-        if (current->need_resched)
-        {
-            schedule();
-        }
-    }
 }
