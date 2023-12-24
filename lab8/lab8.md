@@ -1,6 +1,56 @@
 # 扩展练习 Challenge1：完成基于“UNIX的PIPE机制”的设计方案
 
 ```C
+struct process {
+    // 进程相关信息...
+    struct list_head list; // 用于将进程链接到等待队列中
+};
+
+struct semaphore {
+    int value; // 信号量的值，表示可用资源的数量
+    struct list_head waiting_processes; // 用于存储等待该信号量的进程列表
+    struct mutex lock; // 用于保护信号量结构的互斥锁
+    // 可能的其他字段，如中断标志等
+};
+
+// 初始化信号量
+void semaphore_init(struct semaphore *sem, int initial_value) {
+    sem->value = initial_value;
+    INIT_LIST_HEAD(&sem->waiting_processes);
+    mutex_init(&sem->lock);
+}
+
+// 信号量的 down 操作
+void semaphore_down(struct semaphore *sem) {
+    mutex_lock(&sem->lock);
+    while (sem->value <= 0) {
+        // 当信号量不可用时，将当前进程添加到等待队列中，并释放互斥锁
+        // 然后挂起当前进程，等待信号量变为可用
+        struct process *current_process = get_current_process();
+        list_add_tail(&current_process->list, &sem->waiting_processes);
+        mutex_unlock(&sem->lock);
+        schedule(); // 切换到其他进程
+        mutex_lock(&sem->lock);
+    }
+    sem->value--;
+    mutex_unlock(&sem->lock);
+}
+
+// 信号量的 up 操作
+void semaphore_up(struct semaphore *sem) {
+    mutex_lock(&sem->lock);
+    sem->value++;
+    if (!list_empty(&sem->waiting_processes)) {
+        // 如果有等待的进程，唤醒队列中的第一个进程
+        struct process *waiting_process = list_first_entry(&sem->waiting_processes, struct process, list);
+        list_del(&waiting_process->list);
+        wake_up_process(waiting_process);
+    }
+    mutex_unlock(&sem->lock);
+}
+```
+
+```C
 // 管道结构
 struct pipe {
     struct semaphore mutex; // 用于互斥访问管道数据结构
